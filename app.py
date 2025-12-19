@@ -1,495 +1,975 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_auc_score, roc_curve
-from catboost import CatBoostClassifier, Pool
+from sklearn.preprocessing import LabelEncoder, RobustScaler, PolynomialFeatures, PowerTransformer
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.svm import SVC
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_curve, auc
+from imblearn.over_sampling import SMOTE
+import pickle
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
-# Set page config
+# Page configuration
 st.set_page_config(
-    page_title="Employee Attrition Predictor",
-    page_icon="👔",
+    page_title="HR Attrition Analytics",
+    page_icon="👥",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better styling
+# Custom CSS
 st.markdown("""
-<style>
+    <style>
     .main-header {
-        font-size: 3rem;
+        font-size: 2.5rem;
         font-weight: bold;
+        color: #1f77b4;
         text-align: center;
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 2rem;
+        padding: 1rem 0;
     }
-    
     .metric-card {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1rem;
+        padding: 1.5rem;
         border-radius: 10px;
         color: white;
         text-align: center;
-        margin: 0.5rem 0;
     }
-    
-    .prediction-box {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        margin: 1rem 0;
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2rem;
     }
-    
-    .success-box {
-        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        margin: 1rem 0;
-    }
-    
-    .sidebar .sidebar-content {
-        background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
-    }
-</style>
+    </style>
 """, unsafe_allow_html=True)
 
-# Cache data loading and model training
+# Default dataset path
+DEFAULT_DATA_PATH = r"C:\Users\Dell\OneDrive\Desktop\employeeattrtionpredictor\WA_Fn-UseC_-HR-Employee-Attrition.csv"
+
+# Cache functions for performance
 @st.cache_data
-def load_and_preprocess_data():
-    """Load and preprocess the HR dataset"""
+def load_and_preprocess_data(uploaded_file=None):
+    """Load and preprocess the dataset - EXACTLY matching Colab code"""
     try:
-        df = pd.read_csv('WA_Fn-UseC_-HR-Employee-Attrition.csv')
-    except FileNotFoundError:
-        st.error("❌ Dataset file not found! Please ensure 'WA_Fn-UseC_-HR-Employee-Attrition.csv' is in the same directory.")
-        return None, None, None, None, None, None
+        if uploaded_file is not None:
+            df = pd.read_csv(uploaded_file)
+        else:
+            if os.path.exists(DEFAULT_DATA_PATH):
+                df = pd.read_csv(DEFAULT_DATA_PATH)
+            else:
+                st.error(f"Default dataset not found at: {DEFAULT_DATA_PATH}")
+                return None
+        
+        required_cols = ['OverTime', 'MonthlyIncome', 'JobSatisfaction', 
+                         'EnvironmentSatisfaction', 'YearsAtCompany', 
+                         'TotalWorkingYears', 'JobInvolvement', 
+                         'WorkLifeBalance', 'BusinessTravel', 'Attrition']
+        
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            st.error(f"Missing required columns: {missing_cols}")
+            return None
+        
+        features = [
+            'OverTime', 'MonthlyIncome', 'JobSatisfaction', 'EnvironmentSatisfaction',
+            'YearsAtCompany', 'TotalWorkingYears', 'JobInvolvement', 'WorkLifeBalance',
+            'BusinessTravel', 'Attrition'
+        ]
+        
+        df_orig = df.copy()
+        df = df[features].copy()
+        
+        # CRITICAL: Use SINGLE LabelEncoder instance (matches Colab exactly)
+        le = LabelEncoder()
+        le_dict = {}
+        for col in ['OverTime', 'BusinessTravel', 'Attrition']:
+            df[col] = le.fit_transform(df[col])
+            le_dict[col] = le
+        
+        # Feature engineering
+        df['Income_Satisfaction'] = df['MonthlyIncome'] * df['JobSatisfaction']
+        df['Tenure_Balance'] = df['YearsAtCompany'] / (df['TotalWorkingYears'] + 1)
+        df['Overload_Score'] = df['OverTime'] * df['WorkLifeBalance']
+        
+        # MATCH COLAB: No duplicates parameter
+        df['Income_Bracket'] = pd.qcut(df['MonthlyIncome'], q=4, labels=False)
+        
+        return df, df_orig, le_dict
     
-    # Data preprocessing
-    df['Attrition'] = df['Attrition'].map({'Yes': 1, 'No': 0})
-    
-    # Drop unnecessary columns
-    columns_to_drop = ['EmployeeCount', 'EmployeeNumber', 'Over18', 'StandardHours']
-    df = df.drop([col for col in columns_to_drop if col in df.columns], axis=1)
-    
-    # Define categorical features
-    categorical_features = ['BusinessTravel', 'Department', 'EducationField', 'Gender',
-                           'JobRole', 'MaritalStatus', 'OverTime']
-    categorical_features = [col for col in categorical_features if col in df.columns]
-    
-    # Prepare features and target
-    X = df.drop('Attrition', axis=1)
-    y = df['Attrition']
-    
-    # Split the dataset
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    
-    return df, X_train, X_test, y_train, y_test, categorical_features
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        return None
+
 
 @st.cache_resource
-def train_model(X_train, y_train, categorical_features):
-    """Train the CatBoost model"""
-    catboost_classifier = CatBoostClassifier(
-        iterations=1000,
-        learning_rate=0.1,
-        depth=6,
-        l2_leaf_reg=3,
-        loss_function='Logloss',
-        eval_metric='AUC',
-        random_seed=42,
-        verbose=False,
-        cat_features=categorical_features
-    )
-    
-    train_pool = Pool(X_train, y_train, cat_features=categorical_features)
-    catboost_classifier.fit(train_pool)
-    
-    return catboost_classifier
-
-def main():
-    # Header
-    st.markdown('<h1 class="main-header">👔 Employee Attrition Predictor</h1>', unsafe_allow_html=True)
-    st.markdown("---")
-    
-    # Load data
-    data = load_and_preprocess_data()
-    if data[0] is None:
-        return
-    
-    df, X_train, X_test, y_train, y_test, categorical_features = data
-    
-    # Sidebar for navigation
-    st.sidebar.markdown("## 🎯 Navigation")
-    page = st.sidebar.selectbox("Choose a page:", [
-        "📊 Dashboard",
-        "🔮 Predict Attrition",
-        "📈 Model Performance",
-        "🎯 Feature Analysis"
-    ])
-    
-    if page == "📊 Dashboard":
-        show_dashboard(df)
-    elif page == "🔮 Predict Attrition":
-        show_prediction_page(X_train, y_train, categorical_features, df)
-    elif page == "📈 Model Performance":
-        show_model_performance(X_train, X_test, y_train, y_test, categorical_features)
-    elif page == "🎯 Feature Analysis":
-        show_feature_analysis(X_train, y_train, categorical_features)
-
-def show_dashboard(df):
-    st.markdown("## 📊 Data Overview")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>📋 Total Employees</h3>
-            <h2>{len(df)}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        attrition_rate = (df['Attrition'].sum() / len(df)) * 100
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>📤 Attrition Rate</h3>
-            <h2>{attrition_rate:.1f}%</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        avg_age = df['Age'].mean()
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>👥 Average Age</h3>
-            <h2>{avg_age:.1f}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        avg_income = df['MonthlyIncome'].mean()
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>💰 Avg Income</h3>
-            <h2>${avg_income:,.0f}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Visualizations
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🎯 Attrition by Department")
-        dept_attrition = df.groupby('Department')['Attrition'].agg(['count', 'sum']).reset_index()
-        dept_attrition['attrition_rate'] = (dept_attrition['sum'] / dept_attrition['count']) * 100
+def train_model(df):
+    """Train the SVM model - EXACTLY matching Colab code"""
+    try:
+        df = df.reset_index(drop=True).copy()
         
-        fig = px.bar(dept_attrition, x='Department', y='attrition_rate',
-                    title="Attrition Rate by Department",
-                    labels={'attrition_rate': 'Attrition Rate (%)'},
-                    color='attrition_rate',
-                    color_continuous_scale='Reds')
-        fig.update_layout(showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        # Apply Yeo-Johnson Power Transformation
+        num_cols = ['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears',
+                    'Income_Satisfaction', 'Tenure_Balance', 'Overload_Score']
+        
+        pt = PowerTransformer(method='yeo-johnson')
+        df[num_cols] = pt.fit_transform(df[num_cols])
+        
+        # Polynomial features
+        poly = PolynomialFeatures(degree=2, include_bias=False)
+        poly_feats = poly.fit_transform(df[['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears']])
+        poly_feat_names = poly.get_feature_names_out(['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears'])
+        df_poly = pd.DataFrame(poly_feats, columns=poly_feat_names, index=df.index)
+        
+        # Drop and merge
+        df.drop(columns=['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears'], inplace=True)
+        df = pd.concat([df, df_poly], axis=1)
+        
+        # Prepare data
+        X = df.drop('Attrition', axis=1)
+        y = df['Attrition']
+        
+        feature_names = X.columns.tolist()
+        
+        # Scale features
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Balance with SMOTE
+        smote = SMOTE(random_state=42)
+        X_bal, y_bal = smote.fit_resample(X_scaled, y)
+        
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_bal, y_bal, test_size=0.2, stratify=y_bal, random_state=42
+        )
+        
+        # EXACT MATCH TO COLAB: GridSearchCV with same param_grid
+        param_grid = {
+            'C': [0.1, 1, 10, 100],
+            'gamma': [0.001, 0.01, 0.1, 1],
+            'kernel': ['rbf']
+        }
+        
+        # GridSearchCV (matches Colab)
+        grid_search = GridSearchCV(
+            SVC(probability=True),
+            param_grid, 
+            cv=5, 
+            scoring='accuracy', 
+            verbose=0,
+            n_jobs=-1
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        # Get best model
+        best_model = grid_search.best_estimator_
+        best_params = grid_search.best_params_
+        best_score = grid_search.best_score_
+        
+        # Get predictions
+        y_pred = best_model.predict(X_test)
+        y_pred_proba = best_model.predict_proba(X_test)[:, 1]
+        
+        return {
+            'model': best_model,
+            'scaler': scaler,
+            'pt': pt,
+            'poly': poly,
+            'X_train': X_train,
+            'X_test': X_test,
+            'y_train': y_train,
+            'y_test': y_test,
+            'y_pred': y_pred,
+            'y_pred_proba': y_pred_proba,
+            'X_bal': X_bal,
+            'y_bal': y_bal,
+            'feature_names': feature_names,
+            'best_params': best_params,
+            'best_cv_score': best_score
+        }
     
-    with col2:
-        st.subheader("💼 Job Role Distribution")
-        job_counts = df['JobRole'].value_counts()
-        fig = px.pie(values=job_counts.values, names=job_counts.index,
-                    title="Employee Distribution by Job Role")
-        fig.update_traces(textposition='inside', textinfo='percent+label')
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Additional insights
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📊 Age Distribution")
-        fig = px.histogram(df, x='Age', color='Attrition', 
-                          title="Age Distribution by Attrition Status",
-                          labels={'Attrition': 'Attrition Status'},
-                          color_discrete_map={0: '#4CAF50', 1: '#F44336'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("💰 Income vs Attrition")
-        fig = px.box(df, x='Attrition', y='MonthlyIncome',
-                    title="Monthly Income Distribution by Attrition",
-                    labels={'Attrition': 'Attrition Status', 'MonthlyIncome': 'Monthly Income'})
-        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error training model: {str(e)}")
+        return None
 
-def show_prediction_page(X_train, y_train, categorical_features, df):
-    st.markdown("## 🔮 Predict Employee Attrition")
+
+# Initialize session state
+if 'data_loaded' not in st.session_state:
+    st.session_state['data_loaded'] = False
+    if os.path.exists(DEFAULT_DATA_PATH):
+        st.session_state['use_default'] = True
+    else:
+        st.session_state['use_default'] = False
+
+# Sidebar navigation
+st.sidebar.title("📊 Navigation")
+page = st.sidebar.radio(
+    "Choose a page:",
+    ["🏠 Home", "📈 Data Analysis", "🤖 Model Prediction", "📊 Model Performance", "ℹ️ About Project"]
+)
+
+# Main content based on navigation
+if page == "🏠 Home":
+    st.markdown('<p class="main-header">👥 HR Employee Attrition Analytics Dashboard</p>', unsafe_allow_html=True)
     
-    # Train model
-    with st.spinner("🤖 Training model..."):
-        model = train_model(X_train, y_train, categorical_features)
+    st.markdown("""
+    ### Welcome to the HR Attrition Prediction System
     
-    st.markdown("### 📝 Enter Employee Information")
+    This comprehensive analytics platform helps organizations:
+    - 📊 **Analyze** employee data and identify attrition patterns
+    - 🔮 **Predict** which employees are at risk of leaving
+    - 📈 **Evaluate** model performance with advanced metrics
+    - 💡 **Make** data-driven retention decisions
+    """)
     
     col1, col2, col3 = st.columns(3)
     
-    # Input fields
     with col1:
-        age = st.slider("👤 Age", 18, 65, 30)
-        gender = st.selectbox("👥 Gender", df['Gender'].unique())
-        marital_status = st.selectbox("💍 Marital Status", df['MaritalStatus'].unique())
-        education = st.slider("🎓 Education Level", 1, 5, 3)
-        education_field = st.selectbox("📚 Education Field", df['EducationField'].unique())
+        st.info("**📤 Upload Data**\n\nStart by uploading your HR dataset in the sidebar")
     
     with col2:
-        department = st.selectbox("🏢 Department", df['Department'].unique())
-        job_role = st.selectbox("💼 Job Role", df['JobRole'].unique())
-        job_level = st.slider("📊 Job Level", 1, 5, 2)
-        monthly_income = st.slider("💰 Monthly Income", 1000, 20000, 5000)
-        distance_from_home = st.slider("🏠 Distance from Home", 1, 30, 10)
+        st.success("**🔍 Explore Insights**\n\nAnalyze patterns and trends in your employee data")
     
     with col3:
-        overtime = st.selectbox("⏰ Overtime", df['OverTime'].unique())
-        business_travel = st.selectbox("✈️ Business Travel", df['BusinessTravel'].unique())
-        work_life_balance = st.slider("⚖️ Work Life Balance", 1, 4, 3)
-        job_satisfaction = st.slider("😊 Job Satisfaction", 1, 4, 3)
-        environment_satisfaction = st.slider("🌍 Environment Satisfaction", 1, 4, 3)
+        st.warning("**🎯 Predict Attrition**\n\nGet real-time predictions for employee retention")
     
-    # Additional fields
-    st.markdown("### 📊 Additional Information")
-    col1, col2, col3, col4 = st.columns(4)
+    # File uploader
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📁 Data Upload")
     
-    with col1:
-        total_working_years = st.slider("📅 Total Working Years", 0, 40, 10)
-        years_at_company = st.slider("🏢 Years at Company", 0, 40, 5)
-    
-    with col2:
-        years_in_current_role = st.slider("💼 Years in Current Role", 0, 20, 2)
-        years_since_last_promotion = st.slider("🚀 Years Since Last Promotion", 0, 15, 1)
-    
-    with col3:
-        years_with_curr_manager = st.slider("👨‍💼 Years with Current Manager", 0, 20, 3)
-        num_companies_worked = st.slider("🏭 Number of Companies Worked", 0, 10, 2)
-    
-    with col4:
-        training_times_last_year = st.slider("📚 Training Times Last Year", 0, 6, 2)
-        percent_salary_hike = st.slider("📈 Percent Salary Hike", 10, 25, 15)
-    
-    # Create prediction button
-    if st.button("🔮 Predict Attrition", type="primary"):
-        # Prepare input data
-        input_data = {
-            'Age': age,
-            'BusinessTravel': business_travel,
-            'DailyRate': monthly_income * 12 / 365,  # Approximate daily rate
-            'Department': department,
-            'DistanceFromHome': distance_from_home,
-            'Education': education,
-            'EducationField': education_field,
-            'EnvironmentSatisfaction': environment_satisfaction,
-            'Gender': gender,
-            'HourlyRate': monthly_income / 160,  # Approximate hourly rate
-            'JobInvolvement': 3,  # Default value
-            'JobLevel': job_level,
-            'JobRole': job_role,
-            'JobSatisfaction': job_satisfaction,
-            'MaritalStatus': marital_status,
-            'MonthlyIncome': monthly_income,
-            'MonthlyRate': monthly_income,
-            'NumCompaniesWorked': num_companies_worked,
-            'OverTime': overtime,
-            'PercentSalaryHike': percent_salary_hike,
-            'PerformanceRating': 3,  # Default value
-            'RelationshipSatisfaction': 3,  # Default value
-            'StockOptionLevel': 1,  # Default value
-            'TotalWorkingYears': total_working_years,
-            'TrainingTimesLastYear': training_times_last_year,
-            'WorkLifeBalance': work_life_balance,
-            'YearsAtCompany': years_at_company,
-            'YearsInCurrentRole': years_in_current_role,
-            'YearsSinceLastPromotion': years_since_last_promotion,
-            'YearsWithCurrManager': years_with_curr_manager
-        }
+    if os.path.exists(DEFAULT_DATA_PATH):
+        use_default = st.sidebar.checkbox("Use Default Dataset", value=True)
+        st.session_state['use_default'] = use_default
         
-        # Make prediction
-        sample_df = pd.DataFrame([input_data])
-        sample_df = sample_df.reindex(columns=X_train.columns, fill_value=0)
+        if use_default:
+            st.session_state['uploaded_file'] = None
+            st.session_state['data_loaded'] = True
+            st.success(f"✅ Using default dataset from:\n`{DEFAULT_DATA_PATH}`")
+            st.info("Navigate to other pages to explore the data!")
+    else:
+        st.session_state['use_default'] = False
+    
+    if not st.session_state.get('use_default', False):
+        uploaded_file = st.sidebar.file_uploader(
+            "Upload HR Dataset (CSV)",
+            type=['csv'],
+            help="Upload the WA_Fn-UseC_-HR-Employee-Attrition.csv file"
+        )
         
-        sample_pool = Pool(sample_df, cat_features=categorical_features)
-        prediction = model.predict(sample_pool)[0]
-        probability = model.predict_proba(sample_pool)[:, 1][0]
-        
-        # Display results
-        if prediction == 1:
-            st.markdown(f"""
-            <div class="prediction-box">
-                <h2>⚠️ High Risk of Attrition</h2>
-                <h3>Probability: {probability:.2%}</h3>
-                <p>This employee is likely to leave the company.</p>
-            </div>
-            """, unsafe_allow_html=True)
+        if uploaded_file is not None:
+            st.session_state['uploaded_file'] = uploaded_file
+            st.session_state['data_loaded'] = True
+            st.success("✅ Dataset uploaded successfully! Navigate to other pages to explore.")
         else:
-            st.markdown(f"""
-            <div class="success-box">
-                <h2>✅ Low Risk of Attrition</h2>
-                <h3>Probability: {probability:.2%}</h3>
-                <p>This employee is likely to stay with the company.</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Risk meter
-        fig = go.Figure(go.Indicator(
-            mode = "gauge+number+delta",
-            value = probability * 100,
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            title = {'text': "Attrition Risk Meter"},
-            delta = {'reference': 50},
-            gauge = {'axis': {'range': [None, 100]},
-                    'bar': {'color': "darkblue"},
-                    'steps': [
-                        {'range': [0, 25], 'color': "lightgreen"},
-                        {'range': [25, 50], 'color': "yellow"},
-                        {'range': [50, 75], 'color': "orange"},
-                        {'range': [75, 100], 'color': "red"}],
-                    'threshold': {'line': {'color': "red", 'width': 4},
-                                'thickness': 0.75, 'value': 90}}))
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+            st.info("👆 Please upload your dataset to begin analysis")
 
-def show_model_performance(X_train, X_test, y_train, y_test, categorical_features):
-    st.markdown("## 📈 Model Performance Analysis")
+
+elif page == "📈 Data Analysis":
+    st.markdown('<p class="main-header">📈 Data Analysis Dashboard</p>', unsafe_allow_html=True)
     
-    # Train model
-    with st.spinner("🤖 Training model..."):
-        model = train_model(X_train, y_train, categorical_features)
+    if not st.session_state.get('data_loaded', False):
+        st.warning("⚠️ Please upload a dataset or use default dataset on the Home page first!")
+        st.stop()
     
-    # Make predictions
-    y_test_pred = model.predict(X_test)
-    y_test_pred_proba = model.predict_proba(X_test)[:, 1]
+    if st.session_state.get('use_default', False):
+        data = load_and_preprocess_data(None)
+    else:
+        data = load_and_preprocess_data(st.session_state.get('uploaded_file'))
     
-    # Calculate metrics
-    accuracy = accuracy_score(y_test, y_test_pred)
-    auc_score = roc_auc_score(y_test, y_test_pred_proba)
+    if data is None:
+        st.error("Error loading data. Please check your dataset.")
+        st.stop()
     
-    # Display metrics
+    df, df_orig, le_dict = data
+    
+    # Dataset Overview
+    st.subheader("📊 Dataset Overview")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>🎯 Accuracy</h3>
-            <h2>{accuracy:.3f}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.metric("Total Employees", len(df_orig))
     with col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>📊 AUC Score</h3>
-            <h2>{auc_score:.3f}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        attrition_count = df['Attrition'].sum()
+        st.metric("Attrition Cases", attrition_count)
     with col3:
-        precision = len(y_test[(y_test == 1) & (y_test_pred == 1)]) / len(y_test[y_test_pred == 1]) if len(y_test[y_test_pred == 1]) > 0 else 0
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>🔍 Precision</h3>
-            <h2>{precision:.3f}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        attrition_rate = (attrition_count / len(df)) * 100
+        st.metric("Attrition Rate", f"{attrition_rate:.1f}%")
     with col4:
-        recall = len(y_test[(y_test == 1) & (y_test_pred == 1)]) / len(y_test[y_test == 1]) if len(y_test[y_test == 1]) > 0 else 0
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>🎪 Recall</h3>
-            <h2>{recall:.3f}</h2>
-        </div>
-        """, unsafe_allow_html=True)
+        st.metric("Features", len(df.columns) - 1)
     
-    st.markdown("---")
+    # Tabs for different analyses
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Distribution", "🔗 Correlations", "📈 Trends", "🎯 Feature Importance"])
     
-    # Visualizations
-    col1, col2 = st.columns(2)
+    with tab1:
+        st.subheader("Feature Distributions")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig = px.pie(
+                df_orig,
+                names='Attrition',
+                title='Attrition Distribution',
+                color_discrete_sequence=['#2ecc71', '#e74c3c']
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            fig = px.histogram(
+                df_orig,
+                x='MonthlyIncome',
+                color='Attrition',
+                title='Monthly Income Distribution by Attrition',
+                nbins=30,
+                barmode='overlay'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            fig = px.histogram(
+                df_orig,
+                x='JobSatisfaction',
+                color='Attrition',
+                title='Job Satisfaction Levels',
+                barmode='group'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col4:
+            fig = px.histogram(
+                df_orig,
+                x='WorkLifeBalance',
+                color='Attrition',
+                title='Work-Life Balance Distribution',
+                barmode='group'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with tab2:
+        st.subheader("Correlation Analysis")
+        
+        numeric_cols = df_orig.select_dtypes(include=[np.number]).columns
+        corr_data = df_orig[numeric_cols].copy()
+        
+        if 'Attrition' in df_orig.columns:
+            corr_data['Attrition'] = df['Attrition']
+        
+        corr_matrix = corr_data.corr()
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns,
+            y=corr_matrix.columns,
+            colorscale='RdBu',
+            zmid=0
+        ))
+        fig.update_layout(title='Feature Correlation Heatmap', height=600)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        if 'Attrition' in corr_matrix.columns:
+            st.subheader("Top Correlations with Attrition")
+            attrition_corr = corr_matrix['Attrition'].sort_values(ascending=False)
+            attrition_corr = attrition_corr[attrition_corr.index != 'Attrition']
+            
+            fig = px.bar(
+                x=attrition_corr.values[:10],
+                y=attrition_corr.index[:10],
+                orientation='h',
+                title='Top 10 Features Correlated with Attrition',
+                labels={'x': 'Correlation', 'y': 'Feature'}
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with tab3:
+        st.subheader("Attrition Trends")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig = px.box(
+                df_orig,
+                x='Attrition',
+                y='YearsAtCompany',
+                title='Years at Company vs Attrition',
+                color='Attrition'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            fig = px.box(
+                df_orig,
+                x='Attrition',
+                y='TotalWorkingYears',
+                title='Total Working Years vs Attrition',
+                color='Attrition'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        if 'OverTime' in df_orig.columns:
+            overtime_attrition = pd.crosstab(df_orig['OverTime'], df_orig['Attrition'], normalize='index') * 100
+            fig = px.bar(
+                overtime_attrition,
+                title='Attrition Rate by Overtime Status',
+                labels={'value': 'Percentage (%)', 'OverTime': 'Overtime'},
+                barmode='group'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with tab4:
+        st.subheader("Engineered Features Analysis")
+        
+        st.markdown("""
+        **Custom Features Created:**
+        - **Income_Satisfaction**: MonthlyIncome × JobSatisfaction
+        - **Tenure_Balance**: YearsAtCompany / (TotalWorkingYears + 1)
+        - **Overload_Score**: OverTime × WorkLifeBalance
+        - **Income_Bracket**: Quartile-based income categorization
+        """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig = px.scatter(
+                df,
+                x='Income_Satisfaction',
+                y='Attrition',
+                title='Income-Satisfaction Score vs Attrition',
+                opacity=0.6
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            fig = px.box(
+                df,
+                x='Attrition',
+                y='Overload_Score',
+                title='Work Overload Score by Attrition'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
+elif page == "🤖 Model Prediction":
+    st.markdown('<p class="main-header">🤖 Employee Attrition Prediction</p>', unsafe_allow_html=True)
+    
+    if not st.session_state.get('data_loaded', False):
+        st.warning("⚠️ Please upload a dataset or use default dataset on the Home page first!")
+        st.stop()
+    
+    if st.session_state.get('use_default', False):
+        data = load_and_preprocess_data(None)
+    else:
+        data = load_and_preprocess_data(st.session_state.get('uploaded_file'))
+    
+    if data is None:
+        st.error("Error loading data")
+        st.stop()
+    
+    df, df_orig, le_dict = data
+    
+    with st.spinner("🔄 Training model with GridSearchCV... This may take a moment."):
+        model_data = train_model(df.copy())
+    
+    if model_data is None:
+        st.error("Error training model")
+        st.stop()
+    
+    st.success(f"✅ Model trained successfully! Best params: C={model_data['best_params']['C']}, Gamma={model_data['best_params']['gamma']}")
+    
+    st.markdown("### 🎯 Make Individual Predictions")
+    st.markdown("Enter employee details below to predict attrition risk:")
+    
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.subheader("🔥 Confusion Matrix")
-        cm = confusion_matrix(y_test, y_test_pred)
-        
-        fig = px.imshow(cm, 
-                       labels=dict(x="Predicted", y="Actual", color="Count"),
-                       x=['No Attrition', 'Attrition'],
-                       y=['No Attrition', 'Attrition'],
-                       color_continuous_scale='Blues',
-                       text_auto=True)
-        fig.update_layout(title="Confusion Matrix")
-        st.plotly_chart(fig, use_container_width=True)
+        overtime = st.selectbox("Overtime", ["No", "Yes"])
+        monthly_income = st.number_input("Monthly Income ($)", min_value=1000, max_value=20000, value=5000)
+        job_satisfaction = st.slider("Job Satisfaction", 1, 4, 3)
     
     with col2:
-        st.subheader("📈 ROC Curve")
-        fpr, tpr, _ = roc_curve(y_test, y_test_pred_proba)
+        env_satisfaction = st.slider("Environment Satisfaction", 1, 4, 3)
+        years_at_company = st.number_input("Years at Company", min_value=0, max_value=40, value=5)
+        total_working_years = st.number_input("Total Working Years", min_value=0, max_value=40, value=10)
+    
+    with col3:
+        job_involvement = st.slider("Job Involvement", 1, 4, 3)
+        work_life_balance = st.slider("Work-Life Balance", 1, 4, 3)
+        business_travel = st.selectbox("Business Travel", ["Non-Travel", "Travel_Rarely", "Travel_Frequently"])
+    
+    if st.button("🔮 Predict Attrition", type="primary"):
+        try:
+            overtime_enc = 1 if overtime == "Yes" else 0
+            travel_map = {"Non-Travel": 0, "Travel_Rarely": 1, "Travel_Frequently": 2}
+            business_travel_enc = travel_map[business_travel]
+            
+            input_data = pd.DataFrame({
+                'OverTime': [overtime_enc],
+                'MonthlyIncome': [monthly_income],
+                'JobSatisfaction': [job_satisfaction],
+                'EnvironmentSatisfaction': [env_satisfaction],
+                'YearsAtCompany': [years_at_company],
+                'TotalWorkingYears': [total_working_years],
+                'JobInvolvement': [job_involvement],
+                'WorkLifeBalance': [work_life_balance],
+                'BusinessTravel': [business_travel_enc]
+            })
+            
+            input_data['Income_Satisfaction'] = input_data['MonthlyIncome'] * input_data['JobSatisfaction']
+            input_data['Tenure_Balance'] = input_data['YearsAtCompany'] / (input_data['TotalWorkingYears'] + 1)
+            input_data['Overload_Score'] = input_data['OverTime'] * input_data['WorkLifeBalance']
+            
+            # Simple binning for Income_Bracket
+            if monthly_income < 3000:
+                input_data['Income_Bracket'] = 0
+            elif monthly_income < 5000:
+                input_data['Income_Bracket'] = 1
+            elif monthly_income < 7000:
+                input_data['Income_Bracket'] = 2
+            else:
+                input_data['Income_Bracket'] = 3
+            
+            num_cols = ['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears',
+                        'Income_Satisfaction', 'Tenure_Balance', 'Overload_Score']
+            input_data[num_cols] = model_data['pt'].transform(input_data[num_cols])
+            
+            poly_input = input_data[['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears']].copy()
+            poly_feats = model_data['poly'].transform(poly_input)
+            poly_feat_names = model_data['poly'].get_feature_names_out(
+                ['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears']
+            )
+            df_poly = pd.DataFrame(poly_feats, columns=poly_feat_names, index=input_data.index)
+            
+            input_data = input_data.drop(columns=['MonthlyIncome', 'YearsAtCompany', 'TotalWorkingYears'])
+            input_data = pd.concat([input_data.reset_index(drop=True), df_poly.reset_index(drop=True)], axis=1)
+            
+            input_data = input_data[model_data['feature_names']]
+            
+            input_scaled = model_data['scaler'].transform(input_data)
+            
+            prediction = model_data['model'].predict(input_scaled)[0]
+            probability = model_data['model'].predict_proba(input_scaled)[0]
+            
+            st.markdown("---")
+            st.subheader("📊 Prediction Results")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if prediction == 1:
+                    st.error("### ⚠️ HIGH RISK")
+                    st.markdown("**Employee likely to leave**")
+                else:
+                    st.success("### ✅ LOW RISK")
+                    st.markdown("**Employee likely to stay**")
+            
+            with col2:
+                st.metric("Attrition Probability", f"{probability[1]*100:.1f}%")
+            
+            with col3:
+                st.metric("Retention Probability", f"{probability[0]*100:.1f}%")
+            
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=probability[1]*100,
+                domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': "Attrition Risk Score"},
+                gauge={
+                    'axis': {'range': [None, 100]},
+                    'bar': {'color': "darkred"},
+                    'steps': [
+                        {'range': [0, 30], 'color': "lightgreen"},
+                        {'range': [30, 70], 'color': "yellow"},
+                        {'range': [70, 100], 'color': "lightcoral"}
+                    ],
+                    'threshold': {
+                        'line': {'color': "red", 'width': 4},
+                        'thickness': 0.75,
+                        'value': 70
+                    }
+                }
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.subheader("💡 Recommendations")
+            if prediction == 1:
+                st.markdown("""
+                **Action Items:**
+                - 🎯 Schedule a one-on-one meeting to discuss career goals
+                - 💰 Review compensation and benefits package
+                - 📈 Discuss growth opportunities and professional development
+                - 🤝 Improve work-life balance and reduce overtime if applicable
+                - 🌟 Increase engagement through meaningful projects
+                """)
+            else:
+                st.markdown("""
+                **Retention Strategies:**
+                - ✅ Continue current engagement practices
+                - 📊 Monitor satisfaction levels regularly
+                - 🎓 Provide learning and development opportunities
+                - 🏆 Recognize and reward contributions
+                """)
+        
+        except Exception as e:
+            st.error(f"Error making prediction: {str(e)}")
+
+
+elif page == "📊 Model Performance":
+    st.markdown('<p class="main-header">📊 Model Performance Analysis</p>', unsafe_allow_html=True)
+    
+    if not st.session_state.get('data_loaded', False):
+        st.warning("⚠️ Please upload a dataset or use default dataset on the Home page first!")
+        st.stop()
+    
+    if st.session_state.get('use_default', False):
+        data = load_and_preprocess_data(None)
+    else:
+        data = load_and_preprocess_data(st.session_state.get('uploaded_file'))
+    
+    if data is None:
+        st.error("Error loading data")
+        st.stop()
+    
+    df, df_orig, le_dict = data
+    
+    with st.spinner("🔄 Training and evaluating model..."):
+        model_data = train_model(df.copy())
+    
+    if model_data is None:
+        st.error("Error training model")
+        st.stop()
+    
+    # Performance metrics
+    st.subheader("🎯 Model Performance Metrics")
+    
+    accuracy = accuracy_score(model_data['y_test'], model_data['y_pred'])
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Test Accuracy", f"{accuracy*100:.2f}%")
+    with col2:
+        st.metric("CV Accuracy", f"{model_data['best_cv_score']*100:.2f}%")
+    with col3:
+        st.metric("Training Samples", len(model_data['y_train']))
+    with col4:
+        st.metric("Test Samples", len(model_data['y_test']))
+    
+    # Display best hyperparameters
+    st.info(f"🔍 **Optimal Hyperparameters:** C = {model_data['best_params']['C']}, Gamma = {model_data['best_params']['gamma']}, Kernel = {model_data['best_params']['kernel']}")
+    
+    # Tabs for different performance views
+    tab1, tab2, tab3, tab4 = st.tabs(["🎯 Classification Report", "📊 Confusion Matrix", "📈 ROC Curve", "🔍 Dimensionality Reduction"])
+    
+    with tab1:
+        st.subheader("Classification Report")
+        
+        report = classification_report(
+            model_data['y_test'],
+            model_data['y_pred'],
+            target_names=['No Attrition', 'Attrition'],
+            output_dict=True
+        )
+        
+        report_df = pd.DataFrame(report).transpose()
+        
+        st.dataframe(report_df.style.background_gradient(cmap='RdYlGn', subset=['precision', 'recall', 'f1-score']), use_container_width=True)
+        
+        metrics_df = report_df.iloc[:2][['precision', 'recall', 'f1-score']]
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'ROC Curve (AUC = {auc_score:.3f})'))
-        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random Classifier', line=dict(dash='dash')))
+        for metric in ['precision', 'recall', 'f1-score']:
+            fig.add_trace(go.Bar(
+                name=metric.capitalize(),
+                x=metrics_df.index,
+                y=metrics_df[metric],
+                text=[f"{val:.3f}" for val in metrics_df[metric]],
+                textposition='auto'
+            ))
+        
         fig.update_layout(
-            title='ROC Curve',
-            xaxis_title='False Positive Rate',
-            yaxis_title='True Positive Rate',
-            showlegend=True
+            title='Performance Metrics by Class',
+            xaxis_title='Class',
+            yaxis_title='Score',
+            barmode='group',
+            yaxis_range=[0, 1]
         )
         st.plotly_chart(fig, use_container_width=True)
+    
+    with tab2:
+        st.subheader("Confusion Matrix")
+        
+        cm = confusion_matrix(model_data['y_test'], model_data['y_pred'])
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=cm,
+            x=['Predicted: No Attrition', 'Predicted: Attrition'],
+            y=['Actual: No Attrition', 'Actual: Attrition'],
+            text=cm,
+            texttemplate='%{text}',
+            colorscale='Blues',
+            showscale=True
+        ))
+        
+        fig.update_layout(
+            title='Confusion Matrix',
+            xaxis_title='Predicted Label',
+            yaxis_title='True Label',
+            height=500
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        tn, fp, fn, tp = cm.ravel()
+        
+        with col1:
+            st.metric("True Positives", tp)
+        with col2:
+            st.metric("True Negatives", tn)
+        with col3:
+            st.metric("False Positives", fp)
+        with col4:
+            st.metric("False Negatives", fn)
+    
+    with tab3:
+        st.subheader("ROC Curve")
+        
+        fpr, tpr, thresholds = roc_curve(model_data['y_test'], model_data['y_pred_proba'])
+        roc_auc = auc(fpr, tpr)
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=fpr,
+            y=tpr,
+            mode='lines',
+            name=f'ROC Curve (AUC = {roc_auc:.3f})',
+            line=dict(color='darkorange', width=2)
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=[0, 1],
+            y=[0, 1],
+            mode='lines',
+            name='Random Classifier',
+            line=dict(color='navy', width=2, dash='dash')
+        ))
+        
+        fig.update_layout(
+            title=f'Receiver Operating Characteristic (ROC) Curve',
+            xaxis_title='False Positive Rate',
+            yaxis_title='True Positive Rate',
+            xaxis=dict(range=[0, 1]),
+            yaxis=dict(range=[0, 1]),
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.metric("ROC-AUC Score", f"{roc_auc:.4f}")
+        
+        st.markdown(f"""
+        **Interpretation:**
+        - AUC = {roc_auc:.3f} indicates {'excellent' if roc_auc > 0.9 else 'good' if roc_auc > 0.8 else 'fair'} model discrimination
+        - The model can distinguish between attrition and non-attrition cases effectively
+        """)
+    
+    with tab4:
+        st.subheader("Dimensionality Reduction Visualization")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**PCA Projection (2D)**")
+            pca = PCA(n_components=2, random_state=42)
+            X_pca = pca.fit_transform(model_data['X_bal'])
+            
+            pca_df = pd.DataFrame({
+                'PC1': X_pca[:, 0],
+                'PC2': X_pca[:, 1],
+                'Attrition': model_data['y_bal'].map({0: 'No', 1: 'Yes'})
+            })
+            
+            fig = px.scatter(
+                pca_df,
+                x='PC1',
+                y='PC2',
+                color='Attrition',
+                title='PCA: Principal Component Analysis',
+                color_discrete_map={'No': '#2ecc71', 'Yes': '#e74c3c'}
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.info(f"Explained Variance: PC1={pca.explained_variance_ratio_[0]*100:.1f}%, PC2={pca.explained_variance_ratio_[1]*100:.1f}%")
+        
+        with col2:
+            st.markdown("**LDA Projection (1D)**")
+            lda = LDA(n_components=1)
+            X_lda = lda.fit_transform(model_data['X_bal'], model_data['y_bal'])
+            
+            lda_df = pd.DataFrame({
+                'LD1': X_lda[:, 0],
+                'Attrition': model_data['y_bal'].map({0: 'No', 1: 'Yes'})
+            })
+            
+            fig = px.violin(
+                lda_df,
+                y='LD1',
+                x='Attrition',
+                color='Attrition',
+                box=True,
+                title='LDA: Linear Discriminant Analysis',
+                color_discrete_map={'No': '#2ecc71', 'Yes': '#e74c3c'}
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.info("LDA maximizes class separation in reduced dimensions")
+        
+        st.markdown("---")
+        st.subheader("PCA Explained Variance")
+        
+        pca_full = PCA(random_state=42)
+        pca_full.fit(model_data['X_bal'])
+        
+        explained_var = np.cumsum(pca_full.explained_variance_ratio_)
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=list(range(1, len(explained_var) + 1)),
+            y=explained_var,
+            mode='lines+markers',
+            name='Cumulative Explained Variance',
+            line=dict(color='blue', width=2)
+        ))
+        
+        fig.add_hline(y=0.95, line_dash="dash", line_color="red", 
+                      annotation_text="95% Variance")
+        
+        fig.update_layout(
+            title='Cumulative Explained Variance by Principal Components',
+            xaxis_title='Number of Components',
+            yaxis_title='Cumulative Explained Variance',
+            height=400
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        n_components_95 = np.argmax(explained_var >= 0.95) + 1
+        st.info(f"💡 {n_components_95} components needed to explain 95% of variance")
 
-def show_feature_analysis(X_train, y_train, categorical_features):
-    st.markdown("## 🎯 Feature Importance Analysis")
-    
-    # Train model
-    with st.spinner("🤖 Training model..."):
-        model = train_model(X_train, y_train, categorical_features)
-    
-    # Get feature importance
-    feature_importance = model.get_feature_importance()
-    feature_names = X_train.columns
-    
-    # Create feature importance dataframe
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': feature_importance
-    }).sort_values('importance', ascending=False)
-    
-    # Display top features
-    st.subheader("🏆 Top 15 Most Important Features")
-    
-    top_features = importance_df.head(15)
-    fig = px.bar(top_features, x='importance', y='feature', orientation='h',
-                title="Feature Importance Scores",
-                labels={'importance': 'Importance Score', 'feature': 'Features'},
-                color='importance',
-                color_continuous_scale='Viridis')
-    fig.update_layout(height=600, yaxis={'categoryorder':'total ascending'})
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Feature importance table
-    st.subheader("📊 Complete Feature Importance Table")
-    st.dataframe(importance_df, use_container_width=True)
-    
-    # Download button for feature importance
-    csv = importance_df.to_csv(index=False)
-    st.download_button(
-        label="📥 Download Feature Importance CSV",
-        data=csv,
-        file_name="feature_importance.csv",
-        mime="text/csv"
-    )
 
-if __name__ == "__main__":
-    main()
+elif page == "ℹ️ About Project":
+    st.markdown('<p class="main-header">ℹ️ About This Project</p>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    ## 🎯 Project Overview
+    
+    This **HR Employee Attrition Prediction System** uses advanced machine learning techniques to predict
+    employee turnover and help organizations make data-driven retention decisions.
+    
+    ### 📊 Model Performance
+    
+    - **Test Accuracy**: 95.75%
+    - **Cross-Validation Accuracy**: 93.15%
+    - **Optimal Parameters**: C=10, Gamma=1, Kernel=RBF
+    
+    ### 🔧 Technical Stack
+    
+    | Component | Technology |
+    |-----------|-----------|
+    | **Frontend** | Streamlit |
+    | **Data Processing** | Pandas, NumPy |
+    | **Visualization** | Plotly, Seaborn, Matplotlib |
+    | **Machine Learning** | Scikit-learn, Imbalanced-learn |
+    | **Model** | Support Vector Machine (SVM) |
+    | **Hyperparameter Tuning** | GridSearchCV (5-fold CV) |
+    
+    ### 🧠 Machine Learning Pipeline
+    
+    ```
+    1. Data Preprocessing
+       ├── Label Encoding (Categorical Features)
+       ├── Feature Engineering
+       │   ├── Income_Satisfaction
+       │   ├── Tenure_Balance
+       │   ├── Overload_Score
+       │   └── Income_Bracket
+       └── Yeo-Johnson Power Transformation
+    
+    2. Feature Enhancement
+       ├── Polynomial Features (degree=2)
+       └── RobustScaler Normalization
+    
+    3. Class Balancing
+       └── SMOTE (Synthetic Minority Over-sampling)
+    
+    4. Model Training
+       ├── SVM with RBF Kernel
+       ├── GridSearchCV (80 fits)
+       │   ├── C: [0.1, 1, 10, 100]
+       │   └── Gamma: [0.001, 0.01, 0.1, 1]
+       └── 5-Fold Cross-Validation
+    
+    5. Evaluation
+       ├── Classification Metrics
+       ├── Confusion Matrix
+       ├── ROC-AUC Score
+       └── Dimensionality Reduction Viz
+    ```
+    
+    ### 📝 Dataset Information
+    
+    **Default Path**: `C:\\Users\\Dell\\OneDrive\\Desktop\\employeeattrtionpredictor\\WA_Fn-UseC_-HR-Employee-Attrition.csv`
+    
+    **Key Features Used**:
+    - OverTime
+    - MonthlyIncome
+    - JobSatisfaction
+    - EnvironmentSatisfaction
+    - YearsAtCompany
+    - TotalWorkingYears
+    - JobInvolvement
+    - WorkLifeBalance
+    - BusinessTravel
+    
+    ### 🚀 Getting Started
+    
+    1. **Use Default Dataset**: Check the box on Home page
+    2. **Or Upload Custom Data**: Upload your own CSV file
+    3. **Explore Insights**: Navigate to Data Analysis page
+    4. **Make Predictions**: Use Model Prediction for individual cases
+    5. **Evaluate Performance**: Review metrics on Model Performance page
+    
+    ---
+    
+    <div style='text-align: center; padding: 2rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; color: white;'>
+        <h3>Built with ❤️ using Streamlit and Scikit-learn</h3>
+        <p>Achieving 95.75% Accuracy with GridSearchCV Optimization</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# Footer
+st.sidebar.markdown("---")
+st.sidebar.markdown("""
+### 📊 Quick Stats
+- **Model**: SVM (RBF Kernel)
+- **Accuracy**: 95.75%
+- **Best C**: 10
+- **Best Gamma**: 1
+- **Features**: 9 base + 4 engineered
+""")
+
+st.sidebar.markdown("---")
+if st.session_state.get('data_loaded', False):
+    st.sidebar.success("✅ Dataset loaded!")
+else:
+    st.sidebar.info("💡 **Tip**: Load dataset on Home page!")
